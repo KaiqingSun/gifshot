@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GifShot
+GenericName=GIF Screen Recorder
+Comment=框选屏幕区域录制成 GIF，自动压缩并复制到剪贴板
+Exec=@EXEC@ gui
+Icon=camera-video
+Terminal=false
+Categories=Utility;AudioVideo;Recorder;
+Keywords=gif;screen;record;capture;screencast;录屏;截屏;
+StartupNotify=true

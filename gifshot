@@ -1,0 +1,988 @@
+#!/usr/bin/env python3
+"""gifshot — 窗口 GIF 录屏器 (X11 / GNOME)
+
+用法:
+  gifshot                    启动 GUI
+  gifshot region             拖拽框选任意区域
+  gifshot select             十字光标点选整个窗口
+  gifshot toggle             开始 / 结束录制 (同一个键)
+  gifshot start | stop | cancel
+  gifshot compress <文件> [上限MB]   单独压缩已有文件
+  gifshot status
+  gifshot hotkeys install|remove|show
+  gifshot doctor             检查依赖
+  gifshot --version
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+APP = "gifshot"
+__version__ = "1.0.0"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP
+CONFIG_FILE = CONFIG_DIR / "config.json"
+TARGET_FILE = STATE_DIR / "target.json"
+RECORD_FILE = STATE_DIR / "record.json"
+LOG_FILE = STATE_DIR / "gifshot.log"
+
+DEFAULT_CONFIG = {
+    "out_dir": str(Path.home() / "Pictures" / "GIFs"),
+    "fps": 15,
+    "max_width": 800,
+    "draw_mouse": True,
+    "clipboard": "gif",          # gif | uri | off
+    "keep_video": False,
+    "max_seconds": 300,
+    "dither": "bayer:bayer_scale=5",
+    "compress": True,          # 超出上限就自动降规格重编码
+    "max_size_mb": 20,         # 目标体积上限 (MB)
+    "min_width": 320,          # 压缩时不会缩到比这更窄
+    "min_fps": 8,              # 也不会降到比这更低的帧率
+    "compress_tries": 9,      # 够走完 尺寸→帧率→颜色 三级阶梯
+    "region_key": "<Super><Shift>g",
+    "window_key": "<Super><Shift>w",
+    "toggle_key": "<Super><Shift>r",
+}
+
+
+# ---------------------------------------------------------------- utilities
+
+def log(msg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+    try:
+        with LOG_FILE.open("a") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+    if sys.stderr.isatty():
+        sys.stderr.write(line)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            cfg.update(json.loads(CONFIG_FILE.read_text()))
+        except (OSError, ValueError) as exc:
+            log(f"config unreadable, using defaults: {exc}")
+    # 旧配置迁移: select_key -> window_key
+    if "select_key" in cfg and "window_key" not in cfg:
+        cfg["window_key"] = cfg["select_key"]
+    cfg.pop("select_key", None)
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.replace(path)
+
+
+def notify(title, body="", icon="media-record", urgency="normal"):
+    if shutil.which("notify-send"):
+        subprocess.run(
+            ["notify-send", "-a", "GifShot", "-u", urgency, "-i", icon,
+             "-h", f"string:x-canonical-private-synchronous:{APP}", title, body],
+            check=False,
+        )
+
+
+def run(cmd, **kw):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False, **kw)
+    except OSError as exc:
+        log(f"run {cmd[0]} failed: {exc}")
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except (OSError, TypeError):
+        return False
+    return True
+
+
+MISSING_HINT = (
+    "缺少依赖。请运行:\n"
+    "  sudo apt install -y ffmpeg xdotool xclip x11-utils python3-gi-cairo"
+)
+
+
+def require(*tools):
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        msg = f"缺少命令: {', '.join(missing)}"
+        notify("GifShot: 依赖缺失", msg, icon="dialog-error", urgency="critical")
+        print(msg, file=sys.stderr)
+        print(MISSING_HINT, file=sys.stderr)
+        sys.exit(1)
+
+
+# ------------------------------------------------------------ window picking
+
+def _frame_extents(win_id):
+    """CSD 窗口带不可见阴影边框, 用 _GTK_FRAME_EXTENTS 裁掉。"""
+    out = run(["xprop", "-id", win_id, "_GTK_FRAME_EXTENTS"]).stdout
+    nums = re.findall(r"\d+", out.split("=")[-1]) if "=" in out else []
+    if len(nums) == 4:
+        return [int(n) for n in nums]      # left, right, top, bottom
+    return [0, 0, 0, 0]
+
+
+def _screen_size():
+    """root 窗口尺寸 = 所有显示器的并集。
+
+    注意别用 `xdotool getdisplaygeometry`, 它只返回主显示器大小,
+    双屏下会把副屏上的选区整个裁掉。
+    """
+    out = run(["xwininfo", "-root"]).stdout
+    w = re.search(r"Width:\s+(\d+)", out)
+    h = re.search(r"Height:\s+(\d+)", out)
+    if w and h:
+        return int(w.group(1)), int(h.group(1))
+    return 1 << 30, 1 << 30
+
+
+def window_geometry(win_id):
+    out = run(["xwininfo", "-id", win_id]).stdout
+    def grab(label):
+        m = re.search(rf"{label}:\s+(-?\d+)", out)
+        return int(m.group(1)) if m else None
+
+    x, y = grab("Absolute upper-left X"), grab("Absolute upper-left Y")
+    w, h = grab("Width"), grab("Height")
+    if None in (x, y, w, h):
+        return None
+
+    left, right, top, bottom = _frame_extents(win_id)
+    x, y = x + left, y + top
+    w, h = w - left - right, h - top - bottom
+
+    # 裁到屏幕内 —— x11grab 越界会直接失败
+    sw, sh = _screen_size()
+    x0, y0 = max(0, x), max(0, y)
+    w -= x0 - x
+    h -= y0 - y
+    w = min(w, sw - x0)
+    h = min(h, sh - y0)
+    w, h = w - (w % 2), h - (h % 2)       # 编码器要求偶数
+    if w < 16 or h < 16:
+        return None
+
+    name = run(["xdotool", "getwindowname", win_id]).stdout.strip()
+    return {"id": win_id, "name": name, "x": x0, "y": y0, "w": w, "h": h}
+
+
+def normalize_rect(x1, y1, x2, y2):
+    """两个角点 -> 可直接喂给 x11grab 的矩形 (裁进屏幕, 偶数边长)。"""
+    sw, sh = _screen_size()
+    x, y = max(0, int(min(x1, x2))), max(0, int(min(y1, y2)))
+    rx, by = min(sw, int(max(x1, x2))), min(sh, int(max(y1, y2)))
+    w, h = rx - x, by - y
+    w, h = w - (w % 2), h - (h % 2)
+    if w < 16 or h < 16:
+        return None
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def cmd_region(_args=None):
+    """全屏半透明覆盖层, 拖拽框选。轻点一下则退化为点选窗口。"""
+    import cairo
+    import gi
+    try:
+        gi.require_foreign("cairo")      # python3-gi-cairo, GTK 画图必须
+    except Exception:
+        msg = "框选需要 cairo 桥接: sudo apt install -y python3-gi-cairo"
+        notify("GifShot: 缺少 python3-gi-cairo", msg,
+               icon="dialog-error", urgency="critical")
+        print(msg, file=sys.stderr)
+        return 1
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gtk, Gdk
+
+    display = Gdk.Display.get_default()
+    if display is None:
+        print("没有可用的 X11 显示", file=sys.stderr)
+        return 1
+
+    # 覆盖所有显示器的并集
+    ox = oy = 10 ** 9
+    ex = ey = -10 ** 9
+    for i in range(display.get_n_monitors()):
+        g = display.get_monitor(i).get_geometry()
+        ox, oy = min(ox, g.x), min(oy, g.y)
+        ex, ey = max(ex, g.x + g.width), max(ey, g.y + g.height)
+    ow, oh = ex - ox, ey - oy
+
+    state = {"anchor": None, "cur": None, "result": None}
+
+    # POPUP = override-redirect, 绕开窗管, 位置和层级都可控
+    win = Gtk.Window(type=Gtk.WindowType.POPUP)
+    win.set_app_paintable(True)
+    win.set_keep_above(True)
+    visual = win.get_screen().get_rgba_visual()
+    if visual:
+        win.set_visual(visual)
+    else:
+        win.set_opacity(0.35)          # 无合成器时的退路
+    win.move(ox, oy)
+    win.resize(ow, oh)
+    win.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                   | Gdk.EventMask.BUTTON_RELEASE_MASK
+                   | Gdk.EventMask.POINTER_MOTION_MASK
+                   | Gdk.EventMask.KEY_PRESS_MASK)
+
+    def on_draw(_w, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0.42)
+        cr.paint()
+
+        a, c = state["anchor"], state["cur"]
+        if not (a and c):
+            cr.set_operator(cairo.OPERATOR_OVER)
+            cr.set_source_rgba(1, 1, 1, 0.85)
+            cr.select_font_face("Cantarell", cairo.FONT_SLANT_NORMAL,
+                                cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(15)
+            tip = "拖拽框选区域   ·   单击选中整个窗口   ·   Esc 取消"
+            tw = cr.text_extents(tip).width
+            cr.move_to((ow - tw) / 2, oh / 2)
+            cr.show_text(tip)
+            return False
+
+        x, y = min(a[0], c[0]) - ox, min(a[1], c[1]) - oy
+        w, h = abs(c[0] - a[0]), abs(c[1] - a[1])
+
+        cr.set_source_rgba(0, 0, 0, 0)          # 抠出选区, 露出真实画面
+        cr.rectangle(x, y, w, h)
+        cr.fill()
+
+        cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_source_rgba(0.30, 0.68, 1.0, 1.0)
+        cr.set_line_width(1.5)
+        cr.rectangle(x + 0.75, y + 0.75, w - 1.5, h - 1.5)
+        cr.stroke()
+
+        label = f"{int(w)} × {int(h)}"
+        cr.select_font_face("Cantarell", cairo.FONT_SLANT_NORMAL,
+                            cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(13)
+        te = cr.text_extents(label)
+        bw, bh = te.width + 14, 24
+        bx = min(max(x, 0), ow - bw)
+        by = y - bh - 6 if y - bh - 6 > 0 else y + h + 6   # 贴顶时翻到下面
+        cr.set_source_rgba(0.10, 0.12, 0.15, 0.92)
+        cr.rectangle(bx, by, bw, bh)
+        cr.fill()
+        cr.set_source_rgba(1, 1, 1, 1)
+        cr.move_to(bx + 7, by + 16)
+        cr.show_text(label)
+        return False
+
+    def finish(rect):
+        state["result"] = rect
+        Gtk.main_quit()
+
+    def on_press(_w, ev):
+        if ev.button == 1:
+            state["anchor"] = (ev.x_root, ev.y_root)
+            state["cur"] = (ev.x_root, ev.y_root)
+        else:
+            finish(None)
+        return True
+
+    def on_motion(_w, ev):
+        if state["anchor"]:
+            state["cur"] = (ev.x_root, ev.y_root)
+            win.queue_draw()
+        return True
+
+    def on_release(_w, ev):
+        a = state["anchor"]
+        if not a:
+            return True
+        rect = normalize_rect(a[0], a[1], ev.x_root, ev.y_root)
+        # 几乎没拖动 -> 当成"点选这个窗口"
+        if rect is None and abs(ev.x_root - a[0]) < 10 and abs(ev.y_root - a[1]) < 10:
+            finish(("window", int(ev.x_root), int(ev.y_root)))
+        else:
+            finish(rect)
+        return True
+
+    def on_key(_w, ev):
+        if ev.keyval in (Gdk.KEY_Escape, Gdk.KEY_q):
+            finish(None)
+        return True
+
+    win.connect("draw", on_draw)
+    win.connect("button-press-event", on_press)
+    win.connect("motion-notify-event", on_motion)
+    win.connect("button-release-event", on_release)
+    win.connect("key-press-event", on_key)
+
+    win.show_all()
+    gwin = win.get_window()
+    seat = display.get_default_seat()
+    cursor = Gdk.Cursor.new_from_name(display, "crosshair")
+    seat.grab(gwin, Gdk.SeatCapabilities.ALL, True, cursor, None, None)
+
+    Gtk.main()
+    seat.ungrab()
+    win.destroy()
+    while Gtk.events_pending():          # 让覆盖层真正从屏幕上消失
+        Gtk.main_iteration()
+
+    res = state["result"]
+    if res is None:
+        notify("GifShot", "已取消框选", icon="process-stop")
+        return 1
+
+    if isinstance(res, tuple):           # 点选窗口
+        return _select_window_at(res[1], res[2])
+
+    res.update(mode="region", id=None, name="自定义区域", picked_at=time.time())
+    write_json(TARGET_FILE, res)
+    notify("GifShot: 已框选区域",
+           f"{res['w']}×{res['h']}  —  按录制键开始", icon="camera-video")
+    print(f"region {res['w']}x{res['h']} +{res['x']},{res['y']}")
+    return 0
+
+
+def _select_window_at(x, y):
+    """用坐标反查窗口 id, 供框选层里的'单击选窗口'走同一套逻辑。"""
+    if not shutil.which("xdotool"):
+        notify("GifShot", "点选窗口需要 xdotool", icon="dialog-error")
+        return 1
+    win_id = run(["xdotool", "mousemove", str(x), str(y),
+                  "getmouselocation", "--shell"]).stdout
+    m = re.search(r"WINDOW=(\d+)", win_id)
+    if not m:
+        return 1
+    return _store_window(m.group(1))
+
+
+def _store_window(win_id):
+    geo = window_geometry(win_id)
+    if not geo:
+        notify("GifShot", "无法读取窗口尺寸", icon="dialog-error")
+        return 1
+    geo["mode"] = "window"
+    geo["picked_at"] = time.time()
+    write_json(TARGET_FILE, geo)
+    notify("GifShot: 已选中窗口",
+           f"{geo['name'] or win_id}\n{geo['w']}×{geo['h']}  —  按录制键开始",
+           icon="camera-video")
+    print(f"selected {geo['name']} {geo['w']}x{geo['h']} +{geo['x']},{geo['y']}")
+    return 0
+
+
+def cmd_select(_args=None):
+    require("xdotool", "xwininfo")
+    notify("GifShot", "点击要录制的窗口…", icon="find-location-symbolic")
+    res = run(["xdotool", "selectwindow"])
+    win_id = res.stdout.strip()
+    if not win_id:
+        notify("GifShot", "未选中窗口", icon="dialog-warning")
+        return 1
+    return _store_window(win_id)
+
+
+# --------------------------------------------------------------- recording
+
+def active_record():
+    rec = read_json(RECORD_FILE)
+    if rec and pid_alive(rec.get("ffmpeg_pid")):
+        return rec
+    if rec:
+        RECORD_FILE.unlink(missing_ok=True)
+    return None
+
+
+def cmd_start(_args=None):
+    require("ffmpeg", "xdotool", "xwininfo")
+    if active_record():
+        print("已经在录制中", file=sys.stderr)
+        return 1
+
+    cfg = load_config()
+    target = read_json(TARGET_FILE)
+    if not target:
+        notify("GifShot", "还没有选区，先按框选键", icon="dialog-warning")
+        return cmd_region()
+
+    # 窗口模式下窗口可能被移动/缩放过, 重新量一次; 自由区域固定不动
+    if target.get("mode", "window") == "window" and target.get("id"):
+        fresh = window_geometry(target["id"])
+        if fresh:
+            fresh["mode"] = "window"
+            fresh["picked_at"] = target.get("picked_at", time.time())
+            target = fresh
+            write_json(TARGET_FILE, target)
+
+    if os.fork() != 0:                      # 父进程立刻返回
+        return 0
+    os.setsid()
+    if os.fork() != 0:
+        os._exit(0)
+    _record_daemon(cfg, target)
+    os._exit(0)
+
+
+def _record_daemon(cfg, target):
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    logfd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(logfd, 1)
+    os.dup2(logfd, 2)
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    raw = STATE_DIR / f"raw-{stamp}.mkv"
+    display = os.environ.get("DISPLAY", ":0")
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+        "-f", "x11grab",
+        "-draw_mouse", "1" if cfg["draw_mouse"] else "0",
+        "-framerate", str(cfg["fps"]),
+        "-video_size", f"{target['w']}x{target['h']}",
+        "-i", f"{display}+{target['x']},{target['y']}",
+        "-t", str(cfg["max_seconds"]),
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16",
+        "-pix_fmt", "yuv444p",
+        str(raw),
+    ]
+    log(f"start: {shlex.join(cmd)}")
+    proc = subprocess.Popen(cmd)
+    write_json(RECORD_FILE, {
+        "ffmpeg_pid": proc.pid,
+        "raw": str(raw),
+        "started": time.time(),
+        "target": target,
+    })
+    notify("GifShot: 录制中 ●",
+           f"{target['name'] or ''}\n再按一次录制键结束",
+           icon="media-record")
+
+    rc = proc.wait()
+    RECORD_FILE.unlink(missing_ok=True)
+    log(f"ffmpeg exit {rc}")
+
+    if not raw.exists() or raw.stat().st_size < 1024:
+        raw.unlink(missing_ok=True)
+        notify("GifShot: 录制失败", "没有采集到画面，见 " + str(LOG_FILE),
+               icon="dialog-error", urgency="critical")
+        return
+
+    notify("GifShot: 正在生成 GIF…", "", icon="image-x-generic")
+    out_dir = Path(cfg["out_dir"]).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    gif = out_dir / f"gifshot-{stamp}.gif"
+
+    def step(i):
+        notify("GifShot: 压缩中…",
+               f"{human_size(i['size'])} 超过 {cfg['max_size_mb']} MB 上限，"
+               f"降到 {i['w']}px 重编码", icon="image-x-generic")
+
+    info, err = render_gif(raw, gif, cfg, target["w"], on_step=step)
+    if err:
+        log(f"convert failed: {err}")
+        gif.unlink(missing_ok=True)
+        notify("GifShot: 转换失败", err, icon="dialog-error", urgency="critical")
+        return
+
+    if not cfg["keep_video"]:
+        raw.unlink(missing_ok=True)
+
+    copied = copy_to_clipboard(gif, cfg["clipboard"])
+    detail = f"{gif.name}  ({human_size(info['size'])})"
+    if info["compressed"]:
+        detail += f"  ·  压缩 {info['attempt']} 次 → {info['w']}px/{info['fps']}fps"
+    if copied:
+        detail += "\n已复制到剪贴板"
+    if info["over"]:
+        detail += f"\n⚠ 已压到极限，仍超出 {cfg['max_size_mb']} MB"
+    notify("GifShot: 完成 ✓" if not info["over"] else "GifShot: 完成（超标）",
+           f"{detail}\n{gif.parent}", icon=str(gif),
+           urgency="critical" if info["over"] else "normal")
+    log(f"done {gif} {info['size']}B clipboard={copied} over={info['over']}")
+
+
+FPS_LADDER = [15, 12, 10, 8, 6, 5]
+COLOR_LADDER = [256, 192, 128, 96, 64]
+
+
+def human_size(n):
+    return f"{n / 1024:.0f} KB" if n < 1024 * 1024 else f"{n / 1048576:.1f} MB"
+
+
+def _encode_gif(src, dst, fps, width, colors, dither):
+    # scale 的高度用 -2 而不是 -1, 保证是偶数
+    vf = (f"fps={fps},scale={width}:-2:flags=lanczos,split[a][b];"
+          f"[a]palettegen=max_colors={colors}:stats_mode=diff[p];"
+          f"[b][p]paletteuse=dither={dither}:diff_mode=rectangle")
+    return run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(src), "-filter_complex", vf, "-loop", "0", str(dst)])
+
+
+def render_gif(src, dst, cfg, src_w, on_step=None):
+    """编码成 GIF, 必要时反复降规格直到塞进 max_size_mb。
+
+    降规格的顺序是按"画质损失从小到大"排的: 先缩尺寸(预测式, 一步到位),
+    尺寸到底了再降帧率, 帧率到底了再砍调色板颜色数。
+    返回 (info, error)。info["over"] 为 True 表示压到头了仍然超标。
+    """
+    limit = int(float(cfg.get("max_size_mb", 20)) * 1024 * 1024)
+    width = min(int(cfg["max_width"]), int(src_w))
+    width -= width % 2
+    fps = int(cfg["fps"])
+    colors = 256
+    dither = cfg["dither"]
+    min_width = max(160, int(cfg.get("min_width", 320)))
+    min_fps = max(2, int(cfg.get("min_fps", 8)))
+    tries = max(1, int(cfg.get("compress_tries", 6)))
+    enabled = bool(cfg.get("compress", True)) and limit > 0
+
+    # 在临时文件里反复重编码, 成功后才原子移进输出目录 ——
+    # 否则多轮压缩期间输出目录会一直摆着个写到一半的 gif
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    work = STATE_DIR / f".render-{os.getpid()}.gif"
+    info = err = None
+    try:
+        info, err = _render_loop(src, work, cfg, on_step, limit, width, fps,
+                                 colors, dither, min_width, min_fps, tries,
+                                 enabled)
+        if err or info is None:
+            return None, err or "编码失败"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(work), str(dst))
+    finally:
+        work.unlink(missing_ok=True)
+    return info, None
+
+
+def _render_loop(src, work, cfg, on_step, limit, width, fps, colors, dither,
+                 min_width, min_fps, tries, enabled):
+    info = None
+    for attempt in range(1, tries + 1):
+        r = _encode_gif(src, work, fps, width, colors, dither)
+        if r.returncode != 0 or not work.exists():
+            return None, (r.stderr or "").strip()[-200:] or "ffmpeg 编码失败"
+        size = work.stat().st_size
+        info = {"attempt": attempt, "w": width, "fps": fps,
+                "colors": colors, "size": size, "over": False,
+                "limit": limit, "compressed": attempt > 1}
+        log(f"encode #{attempt}: {width}px {fps}fps {colors}c -> {human_size(size)}")
+        if not enabled or size <= limit:
+            return info, None
+        if on_step:
+            on_step(info)
+
+        # 还有降的余地吗? 按损失从小到大依次尝试
+        ratio = limit / size
+        nw = int(width * max(0.55, min(0.9, ratio ** 0.5)))
+        nw = max(min_width, nw - (nw % 2))
+        if nw < width:
+            width = nw
+            continue
+        nf = next((f for f in FPS_LADDER if f < fps and f >= min_fps), None)
+        if nf:
+            fps = nf
+            continue
+        nc = next((c for c in COLOR_LADDER if c < colors), None)
+        if nc:
+            colors = nc
+            continue
+        break                      # 三个旋钮都拧到底了
+
+    if info:
+        info["over"] = info["size"] > limit
+    return info, None
+
+
+def cmd_compress(args):
+    """gifshot compress <文件> [上限MB] —— 单独压一个已有的 gif/视频"""
+    require("ffmpeg")
+    if not args:
+        print("用法: gifshot compress <文件> [上限MB]", file=sys.stderr)
+        return 2
+    src = Path(args[0]).expanduser()
+    if not src.exists():
+        print(f"找不到 {src}", file=sys.stderr)
+        return 1
+    cfg = load_config()
+    if len(args) > 1:
+        cfg["max_size_mb"] = float(args[1])
+    cfg["compress"] = True
+
+    probe = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width", "-of", "csv=p=0", str(src)])
+    try:
+        src_w = int(probe.stdout.strip().split(",")[0])
+    except (ValueError, IndexError):
+        src_w = int(cfg["max_width"])
+    cfg["max_width"] = min(int(cfg["max_width"]), src_w)
+
+    dst = src.with_name(src.stem + "-small.gif")
+    before = src.stat().st_size
+    print(f"源文件 {human_size(before)}，目标 ≤ {cfg['max_size_mb']} MB …")
+    info, err = render_gif(src, dst, cfg, src_w,
+                           on_step=lambda i: print(
+                               f"  第{i['attempt']}次 {i['w']}px/{i['fps']}fps/"
+                               f"{i['colors']}色 = {human_size(i['size'])}，继续压缩"))
+    if err:
+        print(f"失败: {err}", file=sys.stderr)
+        return 1
+    flag = "  ⚠ 已压到极限仍超标" if info["over"] else ""
+    print(f"→ {dst}  {human_size(info['size'])}  "
+          f"({info['w']}px/{info['fps']}fps/{info['colors']}色){flag}")
+    return 0
+
+
+def copy_to_clipboard(path, mode):
+    if mode == "off" or not shutil.which("xclip"):
+        return False
+    try:
+        if mode == "uri":
+            data = f"file://{path}\n".encode()
+            target = "text/uri-list"
+        else:
+            data = path.read_bytes()
+            target = "image/gif"
+        # xclip 自己 fork 到后台持有 selection
+        subprocess.run(["xclip", "-selection", "clipboard", "-t", target],
+                       input=data, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"clipboard failed: {exc}")
+        return False
+
+
+def cmd_stop(_args=None):
+    rec = active_record()
+    if not rec:
+        print("当前没有在录制", file=sys.stderr)
+        return 1
+    os.kill(rec["ffmpeg_pid"], signal.SIGINT)   # ffmpeg 收到 SIGINT 会正常收尾
+    return 0
+
+
+def cmd_cancel(_args=None):
+    rec = active_record()
+    if not rec:
+        return 1
+    os.kill(rec["ffmpeg_pid"], signal.SIGKILL)
+    Path(rec["raw"]).unlink(missing_ok=True)
+    RECORD_FILE.unlink(missing_ok=True)
+    notify("GifShot", "已取消录制", icon="process-stop")
+    return 0
+
+
+def cmd_toggle(_args=None):
+    return cmd_stop() if active_record() else cmd_start()
+
+
+def cmd_status(_args=None):
+    rec = active_record()
+    target = read_json(TARGET_FILE)
+    if rec:
+        print(f"recording  {time.time() - rec['started']:.0f}s  pid={rec['ffmpeg_pid']}")
+    elif target:
+        print(f"idle  target={target['name']!r} {target['w']}x{target['h']}")
+    else:
+        print("idle  (no window selected)")
+    return 0
+
+
+# ---------------------------------------------------------------- hotkeys
+
+MK = "org.gnome.settings-daemon.plugins.media-keys"
+CK = f"{MK}.custom-keybinding"
+BASE = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings"
+BINDINGS = [("gifshot-region", "GifShot: 框选区域", "region_key", "region"),
+            ("gifshot-select", "GifShot: 选择窗口", "window_key", "select"),
+            ("gifshot-toggle", "GifShot: 开始/结束录制", "toggle_key", "toggle")]
+
+
+def _list_paths():
+    out = run(["gsettings", "get", MK, "custom-keybindings"]).stdout.strip()
+    if out in ("@as []", "[]", ""):
+        return []
+    return re.findall(r"'([^']+)'", out)
+
+
+def _set_paths(paths):
+    val = "[" + ", ".join(f"'{p}'" for p in paths) + "]"
+    run(["gsettings", "set", MK, "custom-keybindings", val])
+
+
+def cmd_hotkeys(args):
+    action = args[0] if args else "show"
+    cfg = load_config()
+    exe = shutil.which("gifshot") or str(Path.home() / ".local/bin/gifshot")
+    paths = _list_paths()
+
+    if action == "install":
+        for slug, name, key, sub in BINDINGS:
+            path = f"{BASE}/{slug}/"
+            if path not in paths:
+                paths.append(path)
+            schema = f"{CK}:{path}"
+            run(["gsettings", "set", schema, "name", name])
+            run(["gsettings", "set", schema, "command", f"{exe} {sub}"])
+            run(["gsettings", "set", schema, "binding", cfg[key]])
+        _set_paths(paths)
+        print(f"已注册快捷键:\n  框选区域  {cfg['region_key']}"
+              f"\n  选择窗口  {cfg['window_key']}\n  录制开关  {cfg['toggle_key']}")
+    elif action == "remove":
+        keep = [p for p in paths if "/gifshot-" not in p]
+        for slug, *_ in BINDINGS:
+            run(["gsettings", "reset-recursively", f"{CK}:{BASE}/{slug}/"])
+        _set_paths(keep)
+        print("已移除快捷键")
+    else:
+        for slug, name, key, sub in BINDINGS:
+            path = f"{BASE}/{slug}/"
+            state = "已注册" if path in paths else "未注册"
+            actual = run(["gsettings", "get", f"{CK}:{path}", "binding"]).stdout.strip()
+            print(f"{name:<22} {cfg[key]:<20} {state} {actual}")
+    return 0
+
+
+def cmd_doctor(_args=None):
+    ok = True
+    for tool, why in [("ffmpeg", "录屏 + GIF 转换"), ("xdotool", "选择窗口"),
+                      ("xclip", "复制到剪贴板"), ("xwininfo", "读取窗口尺寸"),
+                      ("xprop", "裁掉 CSD 阴影"), ("notify-send", "桌面通知")]:
+        p = shutil.which(tool)
+        print(f"  {'✓' if p else '✗'} {tool:<12} {why:<18} {p or '未安装'}")
+        ok = ok and bool(p)
+    try:
+        import gi
+        gi.require_foreign("cairo")
+        cairo_ok = True
+    except Exception:
+        cairo_ok = False
+    print(f"  {'✓' if cairo_ok else '✗'} gi-cairo     框选层绘制"
+          f"            {'python3-gi-cairo' if cairo_ok else '未安装'}")
+    ok = ok and cairo_ok
+    print(f"  {'✓' if os.environ.get('DISPLAY') else '✗'} DISPLAY      X11 会话"
+          f"            {os.environ.get('DISPLAY', '未设置')}")
+    cfg = load_config()
+    print(f"\n输出目录: {cfg['out_dir']}")
+    print(f"配置文件: {CONFIG_FILE}{'' if CONFIG_FILE.exists() else '  (未创建, 用默认值)'}")
+    print(f"日志:     {LOG_FILE}")
+    if not ok:
+        print("\n" + MISSING_HINT)
+    return 0 if ok else 1
+
+
+# -------------------------------------------------------------------- GUI
+
+def cmd_gui(_args=None):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, GLib, Gdk
+
+    cfg = load_config()
+
+    win = Gtk.Window(title="GifShot")
+    win.set_default_size(380, -1)
+    win.set_resizable(False)
+    win.set_icon_name("camera-video")
+
+    hb = Gtk.HeaderBar(title="GifShot", subtitle="窗口 GIF 录屏", show_close_button=True)
+    win.set_titlebar(hb)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    box.set_border_width(16)
+    win.add(box)
+
+    status = Gtk.Label(xalign=0)
+    status.set_markup("<b>就绪</b>")
+    sub = Gtk.Label(xalign=0)
+    sub.get_style_context().add_class("dim-label")
+    box.pack_start(status, False, False, 0)
+    box.pack_start(sub, False, False, 0)
+
+    picks = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, homogeneous=True)
+    b_region = Gtk.Button(label="框选区域")
+    b_select = Gtk.Button(label="选择窗口")
+    picks.pack_start(b_region, True, True, 0)
+    picks.pack_start(b_select, True, True, 0)
+    box.pack_start(picks, False, False, 4)
+
+    b_rec = Gtk.Button(label="开始录制")
+    b_rec.get_style_context().add_class("suggested-action")
+    box.pack_start(b_rec, False, False, 0)
+
+    esc = GLib.markup_escape_text
+    keys = Gtk.Label(xalign=0)
+    keys.get_style_context().add_class("dim-label")
+    keys.set_markup(
+        f"<small>全局快捷键   框选 <tt>{esc(cfg['region_key'])}</tt>"
+        f"   窗口 <tt>{esc(cfg['window_key'])}</tt>"
+        f"   录制 <tt>{esc(cfg['toggle_key'])}</tt></small>")
+    box.pack_start(keys, False, False, 0)
+
+    box.pack_start(Gtk.Separator(), False, False, 4)
+
+    size_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    chk = Gtk.CheckButton(label="体积上限")
+    chk.set_active(bool(cfg.get("compress", True)))
+    spin = Gtk.SpinButton.new_with_range(0.5, 500, 0.5)
+    spin.set_digits(1)
+    spin.set_value(float(cfg.get("max_size_mb", 20)))
+    spin.set_sensitive(chk.get_active())
+    size_row.pack_start(chk, False, False, 0)
+    size_row.pack_end(Gtk.Label(label="MB"), False, False, 0)
+    size_row.pack_end(spin, False, False, 0)
+    box.pack_start(size_row, False, False, 0)
+
+    hint = Gtk.Label(xalign=0)
+    hint.get_style_context().add_class("dim-label")
+    hint.set_markup("<small>超出上限会自动缩尺寸 → 降帧率 → 减色，直到塞进去</small>")
+    box.pack_start(hint, False, False, 0)
+
+    def save_size(*_a):
+        cfg["compress"] = chk.get_active()
+        cfg["max_size_mb"] = round(spin.get_value(), 1)
+        spin.set_sensitive(chk.get_active())
+        save_config(cfg)
+
+    chk.connect("toggled", save_size)
+    spin.connect("value-changed", save_size)
+
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    b_open = Gtk.Button(label="打开输出目录")
+    b_hot = Gtk.Button(label="注册快捷键")
+    row.pack_start(b_open, True, True, 0)
+    row.pack_start(b_hot, True, True, 0)
+    box.pack_start(row, False, False, 0)
+
+    # GUI 里一律 spawn 子进程: 不能在 GTK 主循环里 fork, 也不能被 selectwindow 阻塞
+    exe = shutil.which("gifshot") or str(Path.home() / ".local/bin/gifshot")
+
+    def spawn(verb):
+        subprocess.Popen([exe, verb], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def pick(verb):
+        win.iconify()                      # 免得挡住要选的目标
+        GLib.timeout_add(200, lambda: (spawn(verb), False)[1])
+        GLib.timeout_add(700, lambda: (win.deiconify(), False)[1])
+
+    def on_region(_b):
+        pick("region")
+
+    def on_select(_b):
+        pick("select")
+
+    def on_rec(_b):
+        spawn("toggle")
+
+    def on_open(_b):
+        Gtk.show_uri_on_window(win, "file://" + str(Path(cfg["out_dir"]).expanduser()),
+                               Gdk.CURRENT_TIME)
+
+    def on_hot(_b):
+        cmd_hotkeys(["install"])
+        notify("GifShot", "全局快捷键已注册")
+
+    b_region.connect("clicked", on_region)
+    b_select.connect("clicked", on_select)
+    b_rec.connect("clicked", on_rec)
+    b_open.connect("clicked", on_open)
+    b_hot.connect("clicked", on_hot)
+    win.connect("destroy", Gtk.main_quit)
+
+    def tick():
+        rec = active_record()
+        target = read_json(TARGET_FILE)
+        if rec:
+            secs = int(time.time() - rec["started"])
+            status.set_markup(f"<b>● 录制中  {secs // 60:02d}:{secs % 60:02d}</b>")
+            t = rec["target"]
+            sub.set_text(f"{t['name'] or t['id']}  ·  {t['w']}×{t['h']}")
+            b_rec.set_label("结束录制")
+            b_region.set_sensitive(False)
+            b_select.set_sensitive(False)
+        else:
+            b_rec.set_label("开始录制")
+            b_region.set_sensitive(True)
+            b_select.set_sensitive(True)
+            if target:
+                is_win = target.get("mode", "window") == "window"
+                status.set_markup("<b>已选中窗口</b>" if is_win else "<b>已框选区域</b>")
+                sub.set_text(f"{target['name'] or target.get('id') or ''}  ·  "
+                             f"{target['w']}×{target['h']}"
+                             f"  ·  +{target['x']},{target['y']}")
+            else:
+                status.set_markup("<b>就绪</b>")
+                sub.set_text("先框选一块区域，或点选一个窗口")
+        return True
+
+    tick()
+    GLib.timeout_add(500, tick)
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+# -------------------------------------------------------------------- main
+
+COMMANDS = {
+    "gui": cmd_gui, "region": cmd_region, "select": cmd_select, "start": cmd_start, "stop": cmd_stop,
+    "toggle": cmd_toggle, "cancel": cmd_cancel, "status": cmd_status,
+    "hotkeys": cmd_hotkeys, "doctor": cmd_doctor, "compress": cmd_compress,
+}
+
+
+def main(argv):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        save_config(DEFAULT_CONFIG)
+
+    name = argv[1] if len(argv) > 1 else "gui"
+    if name in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if name in ("-V", "--version", "version"):
+        print(f"gifshot {__version__}")
+        return 0
+    fn = COMMANDS.get(name)
+    if not fn:
+        print(f"未知命令: {name}\n", file=sys.stderr)
+        print(__doc__, file=sys.stderr)
+        return 2
+    return fn(argv[2:]) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
