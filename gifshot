@@ -782,6 +782,7 @@ def cmd_doctor(_args=None):
         p = shutil.which(tool)
         print(f"  {'✓' if p else '✗'} {tool:<12} {why:<18} {p or '未安装'}")
         ok = ok and bool(p)
+    tools_ok = ok
     try:
         import gi
         gi.require_foreign("cairo")
@@ -791,13 +792,30 @@ def cmd_doctor(_args=None):
     print(f"  {'✓' if cairo_ok else '✗'} gi-cairo     框选层绘制"
           f"            {'python3-gi-cairo' if cairo_ok else '未安装'}")
     ok = ok and cairo_ok
-    print(f"  {'✓' if os.environ.get('DISPLAY') else '✗'} DISPLAY      X11 会话"
-          f"            {os.environ.get('DISPLAY', '未设置')}")
+    tools_ok = tools_ok and cairo_ok
+    # 注意别只看 DISPLAY: Wayland 下的 XWayland 兼容层照样会设置它,
+    # 于是体检全绿但一录就是黑屏。真正决定成败的是会话类型。
+    session = os.environ.get("XDG_SESSION_TYPE", "")
+    display = os.environ.get("DISPLAY", "")
+    if session == "x11":
+        sess_ok, sess_note = True, f"x11  DISPLAY={display or '未设置'}"
+    elif session == "wayland":
+        sess_ok, sess_note = False, "wayland —— x11grab/xdotool 在 Wayland 下无效"
+    elif display:
+        sess_ok, sess_note = True, f"未知({session or '空'})  DISPLAY={display}"
+    else:
+        sess_ok, sess_note = False, "无图形会话 (DISPLAY 未设置)"
+    print(f"  {'✓' if sess_ok else '✗'} 会话类型     X11 显示服务器      {sess_note}")
+    ok = ok and sess_ok
+
     cfg = load_config()
     print(f"\n输出目录: {cfg['out_dir']}")
     print(f"配置文件: {CONFIG_FILE}{'' if CONFIG_FILE.exists() else '  (未创建, 用默认值)'}")
     print(f"日志:     {LOG_FILE}")
-    if not ok:
+    if session == "wayland":
+        print("\n当前是 Wayland 会话，gifshot 无法工作。切回 X11:")
+        print("  注销 → 登录界面点密码框旁的齿轮 ⚙ → 选「Ubuntu on Xorg」→ 登录")
+    if not tools_ok:
         print("\n" + MISSING_HINT)
     return 0 if ok else 1
 

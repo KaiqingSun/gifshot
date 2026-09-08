@@ -149,7 +149,9 @@ gifshot compress screen.mp4 2
 
 - **Wayland** — 不工作。`x11grab` 和 `xdotool` 在 Wayland 下都失效，需要换成
   `wf-recorder` 或 xdg-desktop-portal 的 ScreenCast 接口。目前没做。
-  登录时选「Ubuntu on Xorg」可以用。
+  注销后在登录界面点齿轮 ⚙ 选「Ubuntu on Xorg」即可。
+  注意 Wayland 下的 XWayland 兼容层**照样会设置 `DISPLAY`**，所以不能靠 `DISPLAY`
+  判断——`gifshot doctor` 看的是 `XDG_SESSION_TYPE`。
 - **macOS** — 不支持。采集要换 `avfoundation`（且不能直接指定区域，得整屏采集再 crop）、
   窗口枚举换 CoreGraphics、剪贴板换 NSPasteboard（`pbcopy` 不支持二进制图片类型）、
   快捷键换 Hammerspoon 或 `RegisterEventHotKey`，还要过屏幕录制权限。
@@ -162,7 +164,7 @@ gifshot compress screen.mp4 2
 
 | 现象 | 原因 |
 |---|---|
-| 录出来全黑 / 尺寸不对 | 多半在 Wayland 下。`echo $XDG_SESSION_TYPE` 应该是 `x11` |
+| 录出来全黑 / 尺寸不对 | 多半在 Wayland 下，跑 `gifshot doctor` 会直接指出来 |
 | 框选层不显示、报 cairo 错 | 缺 `python3-gi-cairo` |
 | 快捷键没反应 | `gifshot hotkeys show` 看是否注册；GNOME 下检查有无按键冲突 |
 | 粘贴出来是静态图 | 目标应用不接受 `image/gif`，改用 `"clipboard": "uri"` 粘文件 |
