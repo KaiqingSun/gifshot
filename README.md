@@ -17,7 +17,8 @@ Super+Shift+R   开始录制  →  再按一次结束
 - **拖拽框选**：全屏压暗覆盖层，选区透明可见，实时显示 `800 × 600` 尺寸；单击不拖则退化为「选中鼠标下的整个窗口」
 - **同键起停**：一个快捷键开始，同一个键结束，不用记两组
 - **体积上限**：超出目标大小自动降规格重编码，直到塞进去（默认 20 MB）
-- **自动进剪贴板**：以 `image/gif` 写入，浏览器 / Slack / 聊天软件 Ctrl+V 粘出来是**会动的**
+- **自动进剪贴板**：同时提供 `image/gif` 和 `text/uri-list`，浏览器 / Slack / 聊天软件
+  Ctrl+V 粘出来是**会动的**，文件管理器 / 邮件里粘出来是**文件**
 - **多显示器**：覆盖层横跨所有屏幕，选区可跨屏
 - **CSD 阴影裁剪**：读 `_GTK_FRAME_EXTENTS` 去掉 GNOME 窗口四周的不可见阴影边框
 - **原子输出**：多轮压缩在临时目录进行，输出目录不会出现写到一半的文件
@@ -48,9 +49,9 @@ cd gifshot
 |---|---|
 | `ffmpeg` | 屏幕采集 + GIF 编码 |
 | `xdotool` | 点选窗口 |
-| `xclip` | 写剪贴板 |
-| `x11-utils` | `xwininfo` 量尺寸、`xprop` 读阴影边框 |
+| `x11-utils` | `xwininfo` 量尺寸、`xprop` 读阴影边框、`xdpyinfo` 探测剪贴板上限 |
 | `python3-gi` `python3-gi-cairo` `gir1.2-gtk-3.0` | GTK3 界面和框选覆盖层 |
+| `gir1.2-gtk-4.0` | GTK4，用来持有剪贴板（见下） |
 | `libnotify-bin` | 桌面通知 |
 
 随时可以 `gifshot doctor` 逐项体检。
@@ -126,7 +127,7 @@ gifshot compress screen.mp4 2
 | `max_width` | `800` | 超过就等比缩放 |
 | `draw_mouse` | `true` | 是否录鼠标指针 |
 | `clipboard` | `"gif"` | `gif` / `uri` / `off`，见下 |
-| `max_size_mb` | `20` | 体积上限 |
+| `max_size_mb` | `15` | 体积上限（默认值贴着 X11 剪贴板上限，见下） |
 | `compress` | `true` | 关掉就只编一版，不管多大 |
 | `min_width` | `320` | 压缩时不会缩得比这更窄 |
 | `min_fps` | `8` | 也不会降得比这更低 |
@@ -137,15 +138,33 @@ gifshot compress screen.mp4 2
 
 体积上限和开关在 GUI 里也能直接调。
 
-**`clipboard` 的两种模式**：X11 下一个 selection 同时只能持有一种类型，只能二选一。
+**`clipboard` 的三种模式**
 
-- `"gif"`（默认）— 以 `image/gif` 写入，浏览器、Slack、聊天软件里 Ctrl+V 直接粘出动图
-- `"uri"` — 以 `text/uri-list` 写入，粘的是**文件**，适合文件管理器、邮件附件
+- `"gif"`（默认）— 同时提供 `image/gif` 和 `text/uri-list`，粘到哪儿都合适
+- `"uri"` — 只提供 `text/uri-list`，粘的是文件，适合文件管理器、邮件附件
+- `"off"` — 不碰剪贴板
+
+### 为什么不用 xclip
+
+剪贴板由一个常驻的 GTK4 子进程持有，别的程序接管时它自动退出。不用 `xclip`，因为：
+
+- **xclip 0.13 的 INCR 实现是坏的**。X11 传输超过约 1 MB 就要走 INCR 分块协议，
+  而 xclip 一旦写入这么大的数据，进程虽然还在，却再也不响应任何选区请求——
+  连 4 字节的 `TARGETS` 都不回。实测 312 KB 正常，1 MB 起全挂。
+- **xclip fork 后立刻 `exit 0`**，调用方拿到的返回码永远是成功，无从发现失败。
+  现在改成子进程自报 `READY` 才算数。
+- GTK3 的 `Gtk.Clipboard.set_with_data` 在 PyGObject 里不存在（调了会 core dump），
+  GTK4 的 `Gdk.ContentProvider` 才可用，顺带还能同时提供多个 MIME 类型。
+
+**剪贴板有个 ~15 MB 的硬上限**，由 X 服务器的 `maximum request size` 决定
+（`xdpyinfo | grep "maximum request"`）。超过这条线就必须走 INCR，实测传不完。
+所以 `max_size_mb` 默认设成 15，让 GIF 正好能进剪贴板；万一还是超了，
+会自动退回只放 `text/uri-list`（还能粘成文件），并在通知里说明。
 
 ## 平台支持
 
 **只支持 Linux + X11。** 每一层都绑在 X11 上：`ffmpeg -f x11grab` 采集、
-`xdotool`/`xwininfo`/`xprop` 找窗口、`xclip` 写剪贴板、GNOME `gsettings` 注册快捷键。
+`xdotool`/`xwininfo`/`xprop` 找窗口、X11 selection 传剪贴板、GNOME `gsettings` 注册快捷键。
 
 - **Wayland** — 不工作。`x11grab` 和 `xdotool` 在 Wayland 下都失效，需要换成
   `wf-recorder` 或 xdg-desktop-portal 的 ScreenCast 接口。目前没做。
@@ -168,6 +187,7 @@ gifshot compress screen.mp4 2
 | 框选层不显示、报 cairo 错 | 缺 `python3-gi-cairo` |
 | 快捷键没反应 | `gifshot hotkeys show` 看是否注册；GNOME 下检查有无按键冲突 |
 | 粘贴出来是静态图 | 目标应用不接受 `image/gif`，改用 `"clipboard": "uri"` 粘文件 |
+| 粘不出东西 | GIF 可能超过 ~15 MB 剪贴板上限，`gifshot doctor` 会显示实际上限 |
 | 录制没停下来 | `gifshot cancel` 丢弃当前录制 |
 
 日志在 `~/.local/state/gifshot/gifshot.log`，每次编码的尺寸/帧率/颜色/体积都有记录。

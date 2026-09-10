@@ -40,9 +40,9 @@ elif [[ -z "${DISPLAY:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------- 系统依赖
-APT_PKGS=(ffmpeg xdotool xclip x11-utils python3-gi python3-gi-cairo gir1.2-gtk-3.0 libnotify-bin)
-DNF_PKGS=(ffmpeg xdotool xclip xorg-x11-utils python3-gobject gtk3 libnotify)
-PAC_PKGS=(ffmpeg xdotool xclip xorg-xwininfo xorg-xprop python-gobject gtk3 libnotify)
+APT_PKGS=(ffmpeg xdotool x11-utils python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-gtk-4.0 libnotify-bin)
+DNF_PKGS=(ffmpeg xdotool xorg-x11-utils python3-gobject gtk3 gtk4 libnotify)
+PAC_PKGS=(ffmpeg xdotool xorg-xwininfo xorg-xprop xorg-xdpyinfo python-gobject gtk3 gtk4 libnotify)
 
 install_deps() {
   if command -v apt-get >/dev/null; then
@@ -56,7 +56,7 @@ install_deps() {
     say "用 pacman 安装依赖: ${PAC_PKGS[*]}"
     sudo pacman -S --needed --noconfirm "${PAC_PKGS[@]}"
   else
-    warn "认不出包管理器，请手动安装: ffmpeg xdotool xclip xwininfo xprop PyGObject(GTK3+cairo) libnotify"
+    warn "认不出包管理器，请手动安装: ffmpeg xdotool xwininfo xprop xdpyinfo PyGObject(GTK3+cairo, GTK4) libnotify"
     return
   fi
 }

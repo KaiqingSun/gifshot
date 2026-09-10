@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
     "max_seconds": 300,
     "dither": "bayer:bayer_scale=5",
     "compress": True,          # 超出上限就自动降规格重编码
-    "max_size_mb": 20,         # 目标体积上限 (MB)
+    "max_size_mb": 15,         # 目标体积上限 (MB); 高于 ~16 MB 就进不了 X11 剪贴板
     "min_width": 320,          # 压缩时不会缩到比这更窄
     "min_fps": 8,              # 也不会降到比这更低的帧率
     "compress_tries": 9,      # 够走完 尺寸→帧率→颜色 三级阶梯
@@ -127,7 +127,7 @@ def pid_alive(pid):
 
 MISSING_HINT = (
     "缺少依赖。请运行:\n"
-    "  sudo apt install -y ffmpeg xdotool xclip x11-utils python3-gi-cairo"
+    "  sudo apt install -y ffmpeg xdotool x11-utils python3-gi-cairo gir1.2-gtk-4.0"
 )
 
 
@@ -518,18 +518,24 @@ def _record_daemon(cfg, target):
     if not cfg["keep_video"]:
         raw.unlink(missing_ok=True)
 
-    copied = copy_to_clipboard(gif, cfg["clipboard"])
+    clip = copy_to_clipboard(gif, cfg["clipboard"])
     detail = f"{gif.name}  ({human_size(info['size'])})"
     if info["compressed"]:
         detail += f"  ·  压缩 {info['attempt']} 次 → {info['w']}px/{info['fps']}fps"
-    if copied:
-        detail += "\n已复制到剪贴板"
+    if clip == "gif":
+        detail += "\n已复制到剪贴板，可直接粘贴动图"
+    elif clip == "uri":
+        detail += (f"\n超过 X11 剪贴板上限 {human_size(clipboard_limit())}，"
+                   f"只复制了文件引用（粘贴为文件）")
+    elif clip == "failed":
+        detail += "\n⚠ 复制到剪贴板失败，见日志"
     if info["over"]:
         detail += f"\n⚠ 已压到极限，仍超出 {cfg['max_size_mb']} MB"
-    notify("GifShot: 完成 ✓" if not info["over"] else "GifShot: 完成（超标）",
+    bad = info["over"] or clip == "failed"
+    notify("GifShot: 完成（有问题）" if bad else "GifShot: 完成 ✓",
            f"{detail}\n{gif.parent}", icon=str(gif),
-           urgency="critical" if info["over"] else "normal")
-    log(f"done {gif} {info['size']}B clipboard={copied} over={info['over']}")
+           urgency="critical" if bad else "normal")
+    log(f"done {gif} {info['size']}B clipboard={clip} over={info['over']}")
 
 
 FPS_LADDER = [15, 12, 10, 8, 6, 5]
@@ -663,24 +669,116 @@ def cmd_compress(args):
     return 0
 
 
+CLIP_PID_FILE = STATE_DIR / "clipboard.pid"
+CLIP_FALLBACK_LIMIT = 15 * 1024 * 1024
+
+
+def clipboard_limit():
+    """剪贴板单次能传多少字节。
+
+    超过 X 服务器的 maximum-request-size 就必须走 INCR 分块协议, 而实测
+    这条链路传不完 (16 MB 载荷读回 0 字节, 31 秒超时), 所以我们就卡在
+    这条线以下。留 1 MB 余量给协议开销。
+    """
+    m = re.search(r"maximum request size:\s+(\d+) bytes", run(["xdpyinfo"]).stdout)
+    if m:
+        return max(1 << 20, int(m.group(1)) - (1 << 20))
+    return CLIP_FALLBACK_LIMIT
+
+
+def _kill_previous_owner():
+    """上一次的持有进程还在就先请它退场, 免得越攒越多。"""
+    rec = read_json(CLIP_PID_FILE)
+    pid = (rec or {}).get("pid")
+    if not pid or not pid_alive(pid):
+        return
+    try:                                  # 确认真是我们自己的进程再杀
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return
+    if b"_clipboard" in cmdline:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
 def copy_to_clipboard(path, mode):
-    if mode == "off" or not shutil.which("xclip"):
-        return False
+    """把 GIF 放进剪贴板, 返回 "gif" / "uri" / "failed" / "off"。
+
+    不用 xclip: 它 0.13 的 INCR 实现是坏的, 写入超过 ~1 MB 之后进程假活,
+    连 4 字节的 TARGETS 请求都不再响应, 而且它 fork 后立刻 exit 0, 调用方
+    根本无从发现失败。改成自己起一个 GTK4 进程常驻持有 selection。
+    """
+    if mode == "off":
+        return "off"
+    size = path.stat().st_size
+    limit = clipboard_limit()
+    # 太大就只放文件引用: 至少还能粘成文件, 总比什么都没有强
+    kind = "uri" if (mode == "uri" or size > limit) else "gif"
+    if kind == "uri" and mode != "uri":
+        log(f"clipboard: {human_size(size)} 超过上限 {human_size(limit)}, 退回 uri-list")
+
+    _kill_previous_owner()
     try:
-        if mode == "uri":
-            data = f"file://{path}\n".encode()
-            target = "text/uri-list"
-        else:
-            data = path.read_bytes()
-            target = "image/gif"
-        # xclip 自己 fork 到后台持有 selection
-        subprocess.run(["xclip", "-selection", "clipboard", "-t", target],
-                       input=data, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except (OSError, subprocess.SubprocessError) as exc:
-        log(f"clipboard failed: {exc}")
-        return False
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_clipboard", str(path), kind],
+            start_new_session=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        log(f"clipboard spawn failed: {exc}")
+        return "failed"
+
+    # 等它自报 READY —— 光看进程活着不够, xclip 就是这么骗了我们一次
+    ready = ""
+    try:
+        ready = (proc.stdout.readline() or "").strip()
+    except OSError:
+        pass
+    if ready != "READY":
+        log(f"clipboard owner 未就绪 (收到 {ready!r})")
+        return "failed"
+    write_json(CLIP_PID_FILE, {"pid": proc.pid, "path": str(path), "kind": kind})
+    return kind
+
+
+def cmd_clipboard_owner(args):
+    """内部命令, 由 copy_to_clipboard 拉起: 常驻持有剪贴板直到别人接管。
+
+    必须是独立进程 —— 主程序用 GTK3, 而 GTK3/GTK4 不能同进程共存。
+    """
+    if not args:
+        return 2
+    path = Path(args[0])
+    kind = args[1] if len(args) > 1 else "gif"
+    import gi
+    gi.require_version("Gdk", "4.0")
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gdk, GLib, Gtk
+
+    Gtk.init()
+    display = Gdk.Display.get_default()
+    if display is None:
+        return 1
+    clipboard = display.get_clipboard()
+
+    providers = []
+    if kind == "gif":
+        providers.append(Gdk.ContentProvider.new_for_bytes(
+            "image/gif", GLib.Bytes.new(path.read_bytes())))
+    # uri-list 一起给: 聊天软件粘动图, 文件管理器/邮件粘文件, 各取所需
+    providers.append(Gdk.ContentProvider.new_for_bytes(
+        "text/uri-list", GLib.Bytes.new(f"file://{path}\r\n".encode())))
+
+    if not clipboard.set_content(Gdk.ContentProvider.new_union(providers)):
+        return 1
+    print("READY", flush=True)
+
+    loop = GLib.MainLoop()
+    clipboard.connect("changed",
+                      lambda cb: loop.quit() if not cb.is_local() else None)
+    loop.run()
+    return 0
 
 
 def cmd_stop(_args=None):
@@ -777,8 +875,8 @@ def cmd_hotkeys(args):
 def cmd_doctor(_args=None):
     ok = True
     for tool, why in [("ffmpeg", "录屏 + GIF 转换"), ("xdotool", "选择窗口"),
-                      ("xclip", "复制到剪贴板"), ("xwininfo", "读取窗口尺寸"),
-                      ("xprop", "裁掉 CSD 阴影"), ("notify-send", "桌面通知")]:
+                      ("xwininfo", "读取窗口尺寸"), ("xprop", "裁掉 CSD 阴影"),
+                      ("xdpyinfo", "探测剪贴板上限"), ("notify-send", "桌面通知")]:
         p = shutil.which(tool)
         print(f"  {'✓' if p else '✗'} {tool:<12} {why:<18} {p or '未安装'}")
         ok = ok and bool(p)
@@ -789,6 +887,17 @@ def cmd_doctor(_args=None):
         cairo_ok = True
     except Exception:
         cairo_ok = False
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk as _Gtk4                      # noqa: F401
+        gtk4_ok = True
+    except Exception:
+        gtk4_ok = False
+    print(f"  {'✓' if gtk4_ok else '✗'} GTK4         剪贴板持有"
+          f"            {'gir1.2-gtk-4.0' if gtk4_ok else '未安装'}")
+    ok = ok and gtk4_ok
+    tools_ok = tools_ok and gtk4_ok
     print(f"  {'✓' if cairo_ok else '✗'} gi-cairo     框选层绘制"
           f"            {'python3-gi-cairo' if cairo_ok else '未安装'}")
     ok = ok and cairo_ok
@@ -809,7 +918,10 @@ def cmd_doctor(_args=None):
     ok = ok and sess_ok
 
     cfg = load_config()
-    print(f"\n输出目录: {cfg['out_dir']}")
+    if os.environ.get("DISPLAY"):
+        print(f"\n剪贴板上限: {human_size(clipboard_limit())}"
+              f"  (X11 单次请求上限决定，超过只能粘文件引用)")
+    print(f"输出目录: {cfg['out_dir']}")
     print(f"配置文件: {CONFIG_FILE}{'' if CONFIG_FILE.exists() else '  (未创建, 用默认值)'}")
     print(f"日志:     {LOG_FILE}")
     if session == "wayland":
@@ -978,6 +1090,7 @@ COMMANDS = {
     "gui": cmd_gui, "region": cmd_region, "select": cmd_select, "start": cmd_start, "stop": cmd_stop,
     "toggle": cmd_toggle, "cancel": cmd_cancel, "status": cmd_status,
     "hotkeys": cmd_hotkeys, "doctor": cmd_doctor, "compress": cmd_compress,
+    "_clipboard": cmd_clipboard_owner,
 }
 
 
